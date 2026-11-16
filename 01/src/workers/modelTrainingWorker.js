@@ -3,7 +3,7 @@ import { workerEvents } from '../events/constants.js';
 
 console.log('Model training worker initialized');
 let _globalCtx = {};
-
+let _model = null;
 const WEIGHTS = {
     category: 0.4,
     color: 0.3,
@@ -94,12 +94,23 @@ function encodeUser(user, context) {
             user.purchases.map(product => encodeProduct(product, context))
         ).mean(0).reshape([1, context.dimentions])
     }
+
+    return tf.concat1d(
+        [
+            tf.zeros([1]),
+            tf.tensor1d([
+                normalize(user.age, context.minAge, context.maxAge) * WEIGHTS.age
+            ]),
+            tf.zeros([context.numCategories]),
+            tf.zeros([context.numColors])
+        ]
+    )
 }
 
 function createTrainingData(context) {
     const inputs = []
     const labels = []
-    context.users.forEach(user => {
+    context.users.filter(u => u.purchases.length).forEach(user => {
         const useVector = encodeUser(user, context).dataSync()
         context.products.forEach(product => {
             const productVector = encodeProduct(product, context).dataSync()
@@ -115,6 +126,59 @@ function createTrainingData(context) {
         ys: tf.tensor2d(labels, [labels.length, 1]),
         inputDimention: context.dimentions * 2
     }
+}
+
+async function configureNeuralNetAndTrain(trainData) {
+    const model = tf.sequential()
+
+    model.add(
+        tf.layers.dense({
+            inputShape: [trainData.inputDimention],
+            units: 128,
+            activation: 'relu'
+        })
+    )
+
+    model.add(
+        tf.layers.dense({
+            units: 64,
+            activation: 'relu'
+        })
+    )
+
+    model.add(
+        tf.layers.dense({
+            units: 32,
+            activation: 'relu'
+        })
+    )
+
+    model.add(
+        tf.layers.dense({ units: 1, activation: 'sigmoid' })
+    )
+
+    model.compile({
+        optimizer: tf.train.adam(0.01),
+        loss: 'binaryCrossentropy',
+        metrics: ['accuracy']
+    })
+
+    await model.fit(trainData.xs, trainData.ys, {
+        epochs: 100,
+        batchSize: 32,
+        shuffle: true,
+        callbacks: {
+            onEpochEnd: (epoch, logs) => {
+                postMessage({
+                    type: workerEvents.trainingLog,
+                    epoch: epoch,
+                    loss: logs.loss,
+                    accuracy: logs.acc
+                });
+            }
+        }
+    })
+    return model
 }
 
 async function trainModel({ users }) {
@@ -137,28 +201,36 @@ async function trainModel({ users }) {
     _globalCtx = context
 
     const trainData = createTrainingData(context)
+    _model = await configureNeuralNetAndTrain(trainData)
 
-    postMessage({
-        type: workerEvents.trainingLog,
-        epoch: 1,
-        loss: 1,
-        accuracy: 1
-    });
+    postMessage({ type: workerEvents.progressUpdate, progress: { progress: 100 } });
+    postMessage({ type: workerEvents.trainingComplete });
 
-    setTimeout(() => {
-        postMessage({ type: workerEvents.progressUpdate, progress: { progress: 100 } });
-        postMessage({ type: workerEvents.trainingComplete });
-    }, 1000);
 
 
 }
 function recommend(user, ctx) {
+    if (!_model) return;
+    const context = _globalCtx
+    const userVector = encodeUser(user, context).dataSync()
+    const inputs = context.productVectors.map(({ vector }) => {
+        return [...userVector, ...vector]
+    })
+
+    const inputTensor = tf.tensor2d(inputs)
+
+    const predictions = _model.predict(inputTensor);
+
+    const scores = predictions.dataSync();
+    const recommendations = context.productVectors.map((item, index) => { return { ...item.meta, name: item.name, score: scores[index] } })
+
+    const sortedItems = recommendations.sort((a, b) => b.score - a.score)
     console.log('will recommend for user:', user)
-    // postMessage({
-    //     type: workerEvents.recommend,
-    //     user,
-    //     recommendations: []
-    // });
+    postMessage({
+        type: workerEvents.recommend,
+        user,
+        recommendations: sortedItems
+    });
 }
 
 
