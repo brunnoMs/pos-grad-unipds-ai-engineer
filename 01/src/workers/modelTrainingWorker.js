@@ -115,7 +115,7 @@ function createTrainingData(context) {
         context.products.forEach(product => {
             const productVector = encodeProduct(product, context).dataSync()
 
-            const label = user.purchases.some(purchase => purchase.name === product.name ? 1 : 0)
+            const label = user.purchases.some(purchase => purchase.name === product.name) ? 1 : 0
 
             inputs.push([...useVector, ...productVector])
             labels.push(label)
@@ -190,12 +190,19 @@ async function trainModel({ users }) {
     const context = makeContext(products, users)
 
     context.productVectors = products.map(product => {
+        const productVector = Array.from(encodeProduct(product, context).dataSync());
+
         return {
             name: product.name,
             meta: { ...product },
-            vector: encodeProduct(product, context).dataSync()
+            vector: productVector
         }
 
+    })
+
+    postMessage({
+        type: workerEvents.productVectorsReady,
+        vectors: context.productVectors
     })
 
     _globalCtx = context
@@ -209,34 +216,71 @@ async function trainModel({ users }) {
 
 
 }
-function recommend(user, ctx) {
+async function recommend(user, ctx) {
     if (!_model) return;
     const context = _globalCtx
     const userVector = encodeUser(user, context).dataSync()
-    const inputs = context.productVectors.map(({ vector }) => {
-        return [...userVector, ...vector]
-    })
 
-    const inputTensor = tf.tensor2d(inputs)
+    try {
+        const response = await fetch('http://localhost:3333/api/vectors/users', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(Array.from(userVector))
+        });
 
-    const predictions = _model.predict(inputTensor);
+        const dbResult = await response.json();
 
-    const scores = predictions.dataSync();
-    const recommendations = context.productVectors.map((item, index) => { return { ...item.meta, name: item.name, score: scores[index] } })
+        postMessage({
+            type: workerEvents.userVectorsFromDB,
+            dbResult
+        });
 
-    const sortedItems = recommendations.sort((a, b) => b.score - a.score)
-    console.log('will recommend for user:', user)
-    postMessage({
-        type: workerEvents.recommend,
-        user,
-        recommendations: sortedItems
-    });
+        // collection.query() retorna arrays indexados por query primeiro
+        // (uma query só aqui), e os resultados dessa query em seguida
+        const resultEmbeddings = dbResult.embeddings?.[0] ?? []
+        const resultMetadatas = dbResult.metadatas?.[0] ?? []
+
+        const inputs = resultEmbeddings.map((embedding) => {
+            return [...Array.from(userVector), ...Array.from(embedding)]
+        })
+
+        const inputTensor = tf.tensor2d(inputs)
+        const predictions = _model.predict(inputTensor);
+        const scores = predictions.dataSync();
+
+        const recommendations = resultMetadatas.map((meta, index) => {
+            const name = meta.name || `Product ${index}`
+            return {
+                name,
+                score: scores[index],
+                category: meta.category,
+                color: meta.color,
+                price: meta.price
+            }
+        })
+
+        const sortedItems = recommendations.sort((a, b) => b.score - a.score)
+        console.log('will recommend for user:', user)
+        postMessage({
+            type: workerEvents.recommend,
+            user,
+            recommendations: sortedItems
+        });
+    } catch (error) {
+        console.error('Error fetching user vectors from DB:', error);
+        postMessage({
+            type: workerEvents.recommend,
+            user,
+            recommendations: [],
+            error: error.message
+        });
+    }
 }
 
 
 const handlers = {
     [workerEvents.trainModel]: trainModel,
-    [workerEvents.recommend]: d => recommend(d.user, _globalCtx),
+    [workerEvents.recommend]: async d => await recommend(d.user, _globalCtx),
 };
 
 self.onmessage = e => {

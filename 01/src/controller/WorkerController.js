@@ -54,6 +54,14 @@ export class WorkerController {
                 this.#events.dispatchTrainingComplete(event.data);
             }
 
+            if (event.data.type === workerEvents.productVectorsReady) {
+                this.persistProductVectors(event.data.vectors);
+            }
+
+            if (event.data.type === workerEvents.userVectorsFromDB) {
+                console.log('User vectors received from DB:', event.data.dbResult);
+            }
+
             // Handle tfvis data from the worker for initial visualization
             if (event.data.type === workerEvents.tfVisData) {
                 this.#events.dispatchTFVisorData(event.data.data);
@@ -76,4 +84,25 @@ export class WorkerController {
     triggerRecommend(user) {
         this.#worker.postMessage({ action: workerEvents.recommend, user });
     }
+
+    async persistProductVectors(vectors) {
+        try {
+            const response = await fetch('http://localhost:3333/api/vectors/products', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(vectors)
+            });
+
+
+            const result = await response.json();
+
+            console.log('Backend response:', result);
+
+        } catch (error) {
+            console.error('Persistence error:', error);
+        }
+    }
+
 }
